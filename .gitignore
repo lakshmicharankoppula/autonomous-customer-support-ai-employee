@@ -1,0 +1,30 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.log
+
+# Virtual environments
+venv/
+.venv/
+
+# API keys and secrets
+.env
+.env.*
+!.env.example
+
+# Local database
+database/company.db
+*.sqlite
+*.sqlite3
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE settings
+.vscode/
+
+# Temporary files
+*.tmp
+*.bak
