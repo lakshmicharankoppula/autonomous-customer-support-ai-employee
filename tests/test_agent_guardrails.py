@@ -79,6 +79,30 @@ class GroundedSummaryTests(unittest.TestCase):
         self.assertIn("delayed", result["final_response"].lower())
         self.assertEqual(len(result["verified_actions"]["ticket_updates"]), 1)
 
+
+    def test_pending_approval_request_counts_as_task_execution_success(self):
+        ledger = [
+            {"tool": "get_ticket", "result": {"found": True, "ticket_id": "T1004", "status": "Open"}},
+            {"tool": "get_order", "result": {"found": True, "order_id": "O1004", "status": "Delivered", "amount": 3200}},
+            {"tool": "get_refund", "result": {"found": True, "refund_id": "R001", "ticket_id": "T1004", "status": "Pending Approval"}},
+            {"tool": "request_human_approval", "result": {"approved": False, "status": "pending", "approval_id": "approval-test-1", "amount_inr": 3200}},
+            {"tool": "update_ticket", "result": {"success": True, "verified": True, "ticket_id": "T1004", "status": "Open", "response": "Refund status is Pending Approval."}},
+        ]
+        task = "Check the refund status and create a human approval request if required. Do not process the refund."
+        result = build_grounded_summary(task, ledger)
+        self.assertTrue(result["success"])
+        self.assertIn("awaiting a decision", result["final_response"])
+        self.assertIn("no financial action was executed", result["final_response"])
+
+    def test_refund_processing_request_never_reports_success_without_integration(self):
+        ledger = [
+            {"tool": "get_refund", "result": {"found": True, "refund_id": "R001", "ticket_id": "T1004", "status": "Pending Approval"}},
+            {"tool": "request_human_approval", "result": {"approved": False, "status": "pending", "approval_id": "approval-test-2", "amount_inr": 3200}},
+        ]
+        result = build_grounded_summary("Process the refund for ticket T1004", ledger)
+        self.assertFalse(result["success"])
+        self.assertIn("no financial action was executed", result["final_response"].lower())
+
     def test_unverified_update_is_not_reported_as_success(self):
         ledger = [{
             "tool": "update_ticket",

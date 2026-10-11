@@ -1,6 +1,8 @@
 import os
 import re
 import time
+import uuid
+import threading
 from contextvars import ContextVar
 from typing import Any
 
@@ -33,6 +35,28 @@ MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 # Each request gets its own ledger so concurrent API requests do not
 # accidentally share tool results.
 RUN_LEDGER: ContextVar[list] = ContextVar("RUN_LEDGER", default=[])
+
+# In-process approval queue for this prototype. Pending approvals are not
+# financial execution; this app has no refund-processing integration. For a
+# multi-worker deployment, move this store to a shared persistent database.
+_APPROVAL_LOCK = threading.Lock()
+_PENDING_APPROVALS: dict[str, dict[str, Any]] = {}
+
+def list_pending_approvals() -> list[dict[str, Any]]:
+    with _APPROVAL_LOCK:
+        return [dict(item) for item in _PENDING_APPROVALS.values() if item["status"] == "pending"]
+
+def decide_approval(approval_id: str, approved: bool, reviewer: str = "api reviewer") -> dict[str, Any] | None:
+    with _APPROVAL_LOCK:
+        item = _PENDING_APPROVALS.get(approval_id)
+        if not item:
+            return None
+        if item["status"] != "pending":
+            return dict(item)
+        item["status"] = "approved" if approved else "rejected"
+        item["reviewer"] = reviewer[:100]
+        item["decided_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        return dict(item)
 
 
 def record_event(tool: str, result: dict) -> None:
@@ -193,26 +217,35 @@ def resolve_ticket_tool(ticket_id: str) -> dict:
         subject = str(ticket[3] or "").lower()
         order_id = ticket[2]
 
+        description = str(ticket[4] or "").lower()
+        ticket_text = f"{subject} {description}"
         if order_id:
             order = get_order(order_id)
-            if order and str(order[3]).lower() in {"delayed", "shipped", "cancelled"}:
+            if not order:
                 result = {
-                    "success": False,
-                    "verified": False,
-                    "ticket_id": ticket_id,
+                    "success": False, "verified": False, "ticket_id": ticket_id,
+                    "status": ticket[5],
+                    "error": "Ticket cannot be resolved because its linked order could not be verified.",
+                }
+                record_event("resolve_ticket", result)
+                return result
+            order_status = str(order[3] or "").strip().lower()
+            if order_status in {"delayed", "shipped", "cancelled", "processing", "pending", "returned", "failed"}:
+                result = {
+                    "success": False, "verified": False, "ticket_id": ticket_id,
                     "status": ticket[5],
                     "error": (
-                        f"Ticket cannot be resolved while linked order status is "
-                        f"{order[3]}. This prototype has no logistics workflow to "
-                        "complete or verify the delivery issue."
+                        f"Ticket cannot be resolved while linked order status is {order[3]}. "
+                        "The underlying order issue is not verified as complete."
                     ),
                 }
                 record_event("resolve_ticket", result)
                 return result
 
-        if "refund" in subject:
+        refund_related = any(term in ticket_text for term in ("refund", "reimbursement", "money back", "return payment"))
+        if refund_related:
             refund = get_refund(ticket_id)
-            if not refund or str(refund[4]).lower() not in {
+            if not refund or str(refund[4]).strip().lower() not in {
                 "processed", "completed", "successful", "succeeded"
             }:
                 result = {
@@ -274,25 +307,33 @@ def get_refund_tool(ticket_id: str) -> dict:
 
 
 def request_human_approval_tool(reason: str, amount: float) -> dict:
-    print("\n================================")
-    print("HUMAN APPROVAL REQUIRED")
-    print("================================")
-    print(f"Reason: {reason}")
-    print(f"Amount: ₹{amount:,.2f}")
-
-    answer = input("Approve this action? (yes/no): ").strip().lower()
-    approved = answer in {"yes", "y"}
-
-    result = {
-        "approved": approved,
-        "message": (
-            "Human approved the proposed action."
-            if approved
-            else "Human rejected the proposed action. Do not perform it."
-        ),
-        "amount_inr": amount,
+    """Create a pending approval request; never block on terminal input."""
+    try:
+        numeric_amount = float(amount)
+    except (TypeError, ValueError):
+        numeric_amount = -1
+    if numeric_amount < 0 or not (numeric_amount < float("inf")):
+        result = {"approved": False, "status": "rejected", "error": "Invalid approval amount."}
+        record_event("request_human_approval", result)
+        return result
+    approval_id = str(uuid.uuid4())
+    item = {
+        "approval_id": approval_id,
+        "reason": str(reason)[:1000],
+        "amount_inr": round(numeric_amount, 2),
+        "status": "pending",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "message": "Approval is pending. No financial action has been executed.",
     }
-    print("[HUMAN]", "APPROVED" if approved else "REJECTED")
+    with _APPROVAL_LOCK:
+        _PENDING_APPROVALS[approval_id] = item
+    result = {
+        "approved": False,
+        "status": "pending",
+        "approval_id": approval_id,
+        "amount_inr": item["amount_inr"],
+        "message": item["message"],
+    }
     record_event("request_human_approval", result)
     return result
 
@@ -487,8 +528,9 @@ def build_grounded_summary(task: str, ledger: list[dict[str, Any]]) -> dict:
     verified_resolutions = [
         item for item in resolutions if item.get("success") and item.get("verified")
     ]
-    rejected = any(item.get("approved") is False for item in approvals)
-    approved = any(item.get("approved") is True for item in approvals)
+    rejected = any(item.get("status") == "rejected" or item.get("approved") is False and item.get("status") != "pending" for item in approvals)
+    approved = any(item.get("status") == "approved" or item.get("approved") is True for item in approvals)
+    approval_pending = any(item.get("status") == "pending" for item in approvals)
 
     facts = []
     if orders:
@@ -522,9 +564,9 @@ def build_grounded_summary(task: str, ledger: list[dict[str, Any]]) -> dict:
         if rejected:
             facts.append("Human approval for the proposed financial action was rejected.")
         elif approved:
-            facts.append(
-                "Human approval was granted, but approval alone did not execute a refund."
-            )
+            facts.append("Human approval was granted, but approval alone did not execute a refund.")
+        elif approval_pending:
+            facts.append("A human approval request was created and is awaiting a decision.")
     if refunds:
         refund = refunds[-1]
         if refund.get("found"):
@@ -546,6 +588,8 @@ def build_grounded_summary(task: str, ledger: list[dict[str, Any]]) -> dict:
         pending.append("The rejected financial action was not performed.")
     elif approved:
         pending.append("No refund-processing integration exists in this prototype.")
+    elif approval_pending:
+        pending.append("Human approval is pending; no financial action was executed.")
     if not verified_updates:
         pending.append("A verified customer-facing ticket update has not been confirmed.")
 
@@ -553,13 +597,80 @@ def build_grounded_summary(task: str, ledger: list[dict[str, Any]]) -> dict:
     if pending:
         summary += " Pending: " + " ".join(pending)
 
-    success = bool(verified_updates) and not (
-        orders and str(orders[-1].get("status", "")).lower() in {"delayed", "shipped"}
+    # Task execution success is distinct from business-issue resolution.
+    # A pending human approval can mean the requested workflow step succeeded;
+    # it does not mean that the refund itself was executed.
+    task_lower = task.lower()
+    asks_update = any(term in task_lower for term in (
+        "update the ticket", "update ticket", "update the response",
+        "write a response", "respond to the ticket", "customer-facing response",
+    ))
+    asks_resolve = any(term in task_lower for term in (
+        "resolve the ticket", "resolve ticket", "close the ticket", "close ticket",
+    ))
+    refund_action_terms = (
+        "process the refund", "process any refund", "issue the refund",
+        "issue any refund", "refund the customer", "execute refund",
+        "execute the refund",
     )
-    # A task may still be partially completed; avoid marking it successful if the
-    # issue is pending or a financial action was rejected.
-    if rejected or (orders and str(orders[-1].get("status", "")).lower() in {"delayed", "shipped"}):
+    explicitly_forbids_refund_execution = bool(re.search(
+        r"\b(?:do not|don't|dont|never|must not|should not)\s+"
+        r"(?:actually\s+)?(?:process|issue|execute)\b.{0,60}\brefund\b",
+        task_lower,
+    ))
+    asks_refund_action = (
+        any(term in task_lower for term in refund_action_terms)
+        and not explicitly_forbids_refund_execution
+    )
+    asks_approval = any(term in task_lower for term in (
+        "approval", "approve", "human review", "human approval",
+    ))
+
+    has_verified_read = bool(
+        orders
+        or tickets
+        or any(
+            event.get("tool") == "search_customer"
+            and event.get("result", {}).get("found")
+            for event in tool_events
+        )
+        or any(item.get("found") for item in refunds)
+    )
+    approval_request_created = any(
+        item.get("approval_id") and item.get("status") in {"pending", "approved", "rejected"}
+        for item in approvals
+    )
+
+    success = has_verified_read or bool(verified_updates) or bool(verified_resolutions)
+
+    # Requested writes/resolution require verification, not merely a model claim.
+    if asks_update and not verified_updates:
         success = False
+    if asks_resolve and not verified_resolutions:
+        success = False
+
+    # There is deliberately no refund execution integration in this prototype.
+    # Human approval is not equivalent to executing the financial transaction.
+    if asks_refund_action:
+        success = False
+
+    # An explicit request to create/seek approval is successful when the approval
+    # record was actually created, even though the financial action remains pending.
+    if asks_approval and approval_request_created and not asks_refund_action:
+        success = True
+
+    # A rejected proposal is not successful when the user requested the action.
+    # A merely pending approval, however, must not erase successful lookup/request work.
+    if rejected:
+        success = False
+
+    if orders and str(orders[-1].get("status", "")).lower() in {
+        "delayed", "shipped", "cancelled", "processing", "pending", "returned", "failed"
+    }:
+        # A read-only lookup may succeed while the underlying business issue remains open.
+        # Tasks that ask for an update or resolution of that issue remain incomplete.
+        if asks_update or asks_resolve or asks_refund_action:
+            success = False
 
     return {
         "success": success,
@@ -624,7 +735,7 @@ Operating rules:
                 return {
                     "success": False,
                     "task": task,
-                    "error": str(exc),
+                    "error": "Language model request failed. Check server logs for details.",
                     "final_response": "The task could not be completed because the language model request failed.",
                     "tool_history": ledger,
                 }
@@ -673,7 +784,8 @@ Operating rules:
                     try:
                         tool_result = function(**arguments)
                     except Exception as exc:
-                        tool_result = {"success": False, "error": str(exc)}
+                        print(f"[TOOL ERROR] {function_name}: {type(exc).__name__}: {exc}")
+                        tool_result = {"success": False, "error": "Tool execution failed. Check server logs for details."}
                         record_event(function_name, tool_result)
 
                 print("[RESULT]", tool_result)
